@@ -1,0 +1,299 @@
+You are tasked with writing a modular and intelligent policy for solving robotic manipulation tasks using the Franka Panda robot in robosuite.
+
+You must implement a single Python class named `FrankaPolicy` that solves the task described below.
+
+Current task:
+def task_description(self) -> str:
+    return (
+        "Tower of Hanoi with 4 cubes and 3 containers (A, B, C). "
+        "Cubes have different sizes: extra-large (gray), large (green), medium (blue), and small (red). "
+        "At reset, all four cubes are stacked on container A in correct order: extra-large at the bottom, "
+        "then large, medium, and small on top. "
+        "The goal is to move the full tower to container C, preserving the same size order "
+        "(extra-large -> large -> medium -> small), while leaving containers A and B empty. "
+        "Illegal Hanoi placements are not allowed: a larger cube placed on top of a smaller cube terminates the episode."
+    )
+You are given:
+- `obs`: a dictionary of numpy arrays (see Observation Space below)
+Your job is to implement closed-loop low-level control logic that directly returns a 7D action vector at every step. Do not call undefined external primitives.
+-------------------------------------------------------------------------------
+POLICY INTERFACE (MUST MATCH EXACTLY)
+
+Return actions as a 7D vector:
+  [dx, dy, dz, droll, dpitch, dyaw, gripper]
+Each element must be in [-1, 1].
+
+- [dx, dy, dz] are end-effector delta commands (small increments).
+- [droll, dpitch, dyaw] are orientation deltas in axis-angle form.
+- gripper is a scalar:
+    > 0  closes (close threshold ~ +0.04)
+    < 0  opens  (open  threshold ~ -0.04)
+    = 0  holds
+
+Episode lifecycle:
+- Each episode calls `FrankaPolicy.reset()` before it begins so it clears any internal memories. Implement this function based on your logic.
+- `compute_action(self, obs)` is called every control step.
+- After task success, return a safe idle action (e.g., zeros with gripper hold).
+
+-------------------------------------------------------------------------------
+OBSERVATION SPACE (THIS IS EXACTLY WHAT `obs` CONTAINS)
+
+`obs` is a Python dictionary of NumPy arrays. Use the structured keys below (they are the intended interface for policy logic). Do not hardcode numeric constants that are already available in `obs` (e.g., cube sizes).
+
+IMPORTANT
+- The observation space includes noise on object / container positions to simulate real-world uncertainty.
+- Policies must be robust to noise and uncertainty (avoid brittle equality checks, exact thresholds tied to one reset, or assumptions of perfect alignment).
+- Use the fixed key names and fixed concatenation order documented below.
+
+======================================================================
+1) ROBOT OBSERVATIONS
+======================================================================
+
+The robot state is provided through standard robosuite keys, including end-effector pose, gripper state, and joint state.
+
+Common keys used by policies:
+- obs["robot0_eef_pos"]       : np.ndarray, shape (3,)
+  End-effector position in world frame [x, y, z].
+
+- obs["robot0_eef_quat"]      : np.ndarray, shape (4,)
+  End-effector orientation quaternion in [w, x, y, z].
+
+- obs["robot0_gripper_qpos"]  : np.ndarray, shape (2,)
+  Gripper joint positions.
+
+- obs["robot0_gripper_qvel"]  : np.ndarray, shape (2,)
+  Gripper joint velocities.
+
+- obs["robot0_joint_pos"]     : np.ndarray, shape (7,)
+  Robot arm joint positions.
+
+- obs["robot0_joint_vel"]     : np.ndarray, shape (7,)
+  Robot arm joint velocities.
+
+Optional / aggregate robot key (may exist; usually redundant if structured robot keys are used):
+- obs["robot0_proprio-state"] : np.ndarray
+  Aggregated proprioceptive vector (contains a packed combination of robot state features).
+  Prefer the explicit robot keys above when possible.
+
+======================================================================
+2) OBJECT OBSERVATIONS (TOWER OF HANOI: 4 CUBES, 3 CONTAINERS)
+======================================================================
+
+All task-relevant object information is exposed through these structured keys.
+
+------------------------------
+2.1 Cubes (fixed order)
+------------------------------
+
+Fixed cube order everywhere in object observations:
+1. small
+2. med
+3. large
+4. xlarge
+
+- obs["cube_pos"] : np.ndarray, shape (12,)
+  World-frame positions of the 4 cubes, concatenated in fixed order:
+    small  = cube_pos[0:3]
+    med    = cube_pos[3:6]
+    large  = cube_pos[6:9]
+    xlarge = cube_pos[9:12]
+
+- obs["cube_quat"] : np.ndarray, shape (16,)
+  World-frame cube orientations as quaternions in MuJoCo convention [w, x, y, z],
+  concatenated in the same fixed order:
+    small  = cube_quat[0:4]
+    med    = cube_quat[4:8]
+    large  = cube_quat[8:12]
+    xlarge = cube_quat[12:16]
+
+- obs["cube_size"] : np.ndarray, shape (4,)
+  Cube HALF-EDGE lengths in meters (MuJoCo box convention), in the same fixed order:
+    small_half  = cube_size[0]
+    med_half    = cube_size[1]
+    large_half  = cube_size[2]
+    xlarge_half = cube_size[3]
+
+IMPORTANT:
+- `cube_size` values are HALF-EDGE lengths (not full edge lengths).
+- Policy logic should read sizes from `obs["cube_size"]` instead of hardcoding values.
+
+------------------------------
+2.2 Containers / Pegs (fixed order)
+------------------------------
+
+Fixed container order everywhere in container observations:
+1. A
+2. B
+3. C
+
+(These are plate-with-hole container objects acting as Hanoi pegs / target supports.)
+
+- obs["boxes_pos"] : np.ndarray, shape (9,)
+  World-frame positions of the 3 containers, concatenated in fixed order:
+    A = boxes_pos[0:3]
+    B = boxes_pos[3:6]
+    C = boxes_pos[6:9]
+
+- obs["boxes_quat"] : np.ndarray, shape (12,)
+  World-frame container orientations as quaternions [w, x, y, z], same fixed order:
+    A = boxes_quat[0:4]
+    B = boxes_quat[4:8]
+    C = boxes_quat[8:12]
+
+------------------------------
+2.3 Legacy / redundant container keys (may also be present)
+------------------------------
+
+These may exist for compatibility, but policies should prefer `boxes_pos` and `boxes_quat`.
+
+- obs["box_pos"],   obs["box_quat"]     : container A position / quat
+- obs["box_B_pos"], obs["box_B_quat"]   : container B position / quat
+- obs["box_C_pos"], obs["box_C_quat"]   : container C position / quat
+
+======================================================================
+3) AGGREGATE OBJECT KEY (MAY EXIST; DO NOT RELY ON IT)
+======================================================================
+
+- obs["object-state"] : np.ndarray
+  Packed aggregate object vector. Its exact length / composition can change when observables are edited.
+  Do NOT build task logic on this packed vector if the structured keys above are available.
+
+Use the structured keys instead:
+- `cube_pos`, `cube_quat`, `cube_size`
+- `boxes_pos`, `boxes_quat`
+
+======================================================================
+4) NOISE / UNCERTAINTY (SIM2REAL) NOTES
+======================================================================
+
+The policy must be robust to observation noise and small calibration offsets.
+
+Position observations for cubes and containers are noisy:
+- Gaussian position noise is applied (approximately millimeter-scale, e.g., ~5 mm std).
+- A small global XY offset may be applied at reset (scene-wide calibration offset).
+
+Implications for policy design:
+- Do NOT use exact equality checks on positions.
+- Do NOT assume a cube or container is exactly at a nominal coordinate.
+- Use tolerances / margins and relative geometric reasoning.
+- Recompute decisions from current observations at each step (closed-loop behavior).
+- Prefer modular helper functions (e.g., parsing obs, target selection, geometric checks, motion stages).
+
+Quaternions are provided in [w, x, y, z]. Handle orientation checks with tolerance as needed.
+
+======================================================================
+5) POLICY DESIGN REQUIREMENTS (FOR THE LLM POLICY)
+======================================================================
+
+You must create a policy that is:
+- noise-aware
+- uncertainty-robust
+- modular (clear helper functions / reusable logic)
+- closed-loop (reacts to current `obs`, not a fixed scripted trajectory)
+
+The policy should solve the 4-cube Tower of Hanoi manipulation task using the structured observations above.
+
+Key requirements:
+- Parse cube and container poses from `obs` using the documented fixed ordering.
+- Read cube sizes from `obs["cube_size"]` (do not hardcode sizes).
+- Use tolerant geometric checks (distance / height / alignment thresholds with margins).
+- Be robust to noisy object and container positions.
+- Avoid brittle assumptions about perfect stacking or exact reset coordinates.
+- Keep logic general and maintainable (helper functions for parsing, targeting, placement checks, etc.).
+
+======================================================================
+6) Observation Space
+======================================================================
+
+Use these slices (fixed and stable for this environment version):
+
+Cubes:
+- small_pos   = obs["cube_pos"][0:3]
+- med_pos     = obs["cube_pos"][3:6]
+- large_pos   = obs["cube_pos"][6:9]
+- xlarge_pos  = obs["cube_pos"][9:12]
+
+- small_quat  = obs["cube_quat"][0:4]
+- med_quat    = obs["cube_quat"][4:8]
+- large_quat  = obs["cube_quat"][8:12]
+- xlarge_quat = obs["cube_quat"][12:16]
+
+- small_half  = obs["cube_size"][0]
+- med_half    = obs["cube_size"][1]
+- large_half  = obs["cube_size"][2]
+- xlarge_half = obs["cube_size"][3]
+
+Containers:
+- A_pos = obs["boxes_pos"][0:3]
+- B_pos = obs["boxes_pos"][3:6]
+- C_pos = obs["boxes_pos"][6:9]
+
+- A_quat = obs["boxes_quat"][0:4]
+- B_quat = obs["boxes_quat"][4:8]
+- C_quat = obs["boxes_quat"][8:12]
+-------------------------------------------------------------------------------
+TASK AND SUCCESS CONDITIONS
+
+Success is achieved iff:
+- All cubes are inside the hole of container C.
+- Containers A and B contain none of the cubes.
+- Cubes are stacked on C in order:
+    xlarge / extra-large (bottom) → large → medium → small (top).
+- Stack correctness is evaluated using height differences between cubes.
+
+Additionally, illegal Hanoi placements are not allowed: placing a larger cube on top of a smaller cube terminates the episode.
+-------------------------------------------------------------------------------
+CONTAINER HOLE GEOMETRY
+
+Each container is a plate-with-hole object.
+
+The container origin is at its geometric center.
+The hole is NOT at the center.
+
+The hole center is at this container-local offset:
+    hole_offset_local = [0.055, 0.0, 0.0]
+
+This means:
+- The hole is shifted along the container’s local +X axis.
+- The cube must be placed over this hole to count as inside the container.
+
+How to compute the placement target:
+
+If the container is approximately axis-aligned (yaw ≈ 0):
+    hole_center = container_pos + [0.055, 0.0, 0.0]
+
+Otherwise:
+    hole_center = container_pos + R(container_quat) @ hole_offset_local
+
+Container orientation:
+- Containers are approximately axis-aligned (yaw ≈ 0).
+- Still write logic that works with small orientation noise.
+
+  
+-------------------------------------------------------------------------------
+OBJECT SIZE HANDLING (IMPORTANT)
+
+obs["cube_size"] provides cube HALF-EDGE lengths.
+
+- obs["cube_size"] provides HALF-EDGE lengths.
+- If the primitive expects FULL side length, pass:
+    obj_size_full = 2 * half_edge
+- If the primitive expects HALF-EDGE, pass the half-edge directly.
+Your policy must be consistent and use one convention internally.
+
+Sim2real uncertainty:
+- Add a small safety margin when using object sizes for planning.
+
+-------------------------------------------------------------------------------
+NO HARDCODED NAMES / INDICES (WHAT THIS MEANS HERE)
+
+- Do not hardcode environment-internal MuJoCo names or body ids.
+- You MAY use the fixed observation keys listed above (cube_pos, cube_size, boxes_pos, etc.).
+- You MUST NOT assume any other observation keys exist.
+
+-------------------------------------------------------------------------------
+
+--------------------
+OUTPUT REQUIREMENT
+
+Output exactly ONE ```python``` code block and nothing else.

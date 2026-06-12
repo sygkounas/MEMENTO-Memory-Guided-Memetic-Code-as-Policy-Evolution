@@ -1,0 +1,831 @@
+You are designing an EVALUATION MODULE for an evolutionary code-as-policy system.
+
+BIG PICTURE
+We evolve policies (Python code) that control a Franka Panda robot in Robosuite.
+
+FITNESS AND METRICS OUTPUT
+
+At the end of each episode, the environment must return:
+
+    episode_fitness, metrics
+
+Where:
+- episode_fitness is a float in [0,1].
+- metrics is a dictionary describing that episode only.
+
+Across N episodes:
+
+    final_fitness = mean(episode_fitnesses)
+
+The metrics from each episode will be collected into a list:
+
+    all_metrics = [metrics_ep0, metrics_ep1, ...]
+
+So the environment must:
+- compute fitness per episode
+- return metrics per episode
+
+FITNESS SEMANTICS (REQUIRED)
+
+The episode_fitness must be dense and represent continuous progress toward the task goal. The policy is code as policy and needs dense and smart metrics to be able to diagnose possible failures.
+
+Requirements:
+- episode_fitness must reflect partial progress, not only final success.
+- A binary success-only fitness (1.0 on success, 0.0 otherwise) is not allowed.
+- episode_fitness must change as the environment state becomes closer to or farther from the goal.
+- episode_fitness must remain in the range [0,1].
+- episode_fitness must be composed from multiple sub-signals corresponding to different phases of the task.
+- episode_fitness must reflect both interaction quality and goal achievement.
+
+
+Metrics must be designed to support evolutionary debugging of code-as-policy behaviors.
+
+Therefore:
+
+- Metrics must decompose the task into multiple meaningful phases or sub-skills.
+- Metrics must allow identification of where execution failed within an episode.
+- Metrics must include signals related to interaction quality, not only task completion.
+
+
+The metrics must enable distinguishing between different failure modes, such as:
+- never reaching the object
+- reaching but failing to grasp
+- grasping but failing to move
+- moving but failing to place correctly
+- placing but failing final arrangement
+
+Metrics must be continuous whenever possible, not purely binary.
+Binary success flags may be included, but must not be the primary signals.
+
+
+RUNTIME CALL ORDER
+
+For each episode:
+
+1) env.reset() is called.
+2) policy acts through repeated env.step(action).
+3) At the end of the episode:
+       episode_fitness, metrics = env.get_episode_fitness()
+
+Across N episodes:
+       final_fitness = mean(episode_fitnesses)
+
+ENV-SIDE INTERFACE (STRICT)
+
+
+Do not modify reset(), step(), observables, success logic, object definitions, or helper methods.
+
+IMPORTANT TASK INSTANCE
+
+This is a 4-cube / 3-container Tower of Hanoi environment.
+
+Cubes, from smallest to largest:
+- small:  cube          size_small
+- medium: cube_blue     size_med
+- large:  cube_green    size_large
+- xlarge: cube_xlarge   size_xlarge
+
+The cube observation order is strictly:
+    [small, medium, large, xlarge]
+
+Therefore:
+- cube_pos has shape 12 and represents 4x3 flattened positions.
+- cube_quat has shape 16 and represents 4x4 flattened quaternions.
+- cube_size has shape 4.
+
+Containers:
+- A: container
+- B: container_B
+- C: container_C
+
+Goal:
+- Move all 4 cubes from A to C.
+- Final stack on C must be:
+      xlarge bottom -> large -> medium -> small top
+- A and B must be empty.
+
+The dense fitness must track all 4 cubes, not only the original 3.
+
+
+The full env class is:
+from collections import OrderedDict
+import numpy as np
+
+from robosuite.models.objects import BoxObject, MujocoXMLObject
+from robosuite.environments.manipulation.manipulation_env import ManipulationEnv
+from robosuite.models.arenas import TableArena
+from robosuite.models.tasks import ManipulationTask
+from robosuite.utils.mjcf_utils import CustomMaterial, xml_path_completion
+from robosuite.utils.observables import Observable, sensor
+from robosuite.utils.transform_utils import convert_quat, quat2mat
+
+
+class FrankaEnv(ManipulationEnv):
+    """
+    Tower of Hanoi (4 cubes, 3 boxes/pegs)
+
+    NOTE:
+    - This version upgrades the environment / task to 4 cubes and 3 pegs.
+    - I intentionally leave the fitness functions structurally unchanged (as requested),
+      so the current dense fitness still only tracks the original 3 cubes (small/med/large).
+      The new extra cube is included in reset / success / observables / task definition.
+      We can update dense fitness next.
+    """
+
+    def __init__(
+        self,
+        robots,
+        env_configuration="default",
+        controller_configs=None,
+        gripper_types="default",
+        base_types="default",
+        initialization_noise="default",
+        table_full_size=(0.6, 1.1, 0.05),
+        table_friction=(1.0, 5e-3, 1e-4),
+        use_camera_obs=False,
+        use_object_obs=True,
+        placement_initializer=None,
+        has_renderer=False,
+        reward_scale=1.0,
+        has_offscreen_renderer=True,
+        render_camera="frontview",
+        render_collision_mesh=False,
+        render_visual_mesh=True,
+        render_gpu_device_id=-1,
+        control_freq=20,
+        lite_physics=True,
+        horizon=12000,
+        ignore_done=False,
+        hard_reset=True,
+        camera_names="agentview",
+        camera_heights=256,
+        camera_widths=256,
+        camera_depths=False,
+        camera_segmentations=None,
+        renderer="mjviewer",
+        renderer_config=None,
+    ):
+        self.table_full_size = table_full_size
+        self.table_friction = table_friction
+        self.table_offset = np.array((0, 0, 0.8))
+
+        self.reward_scale = reward_scale
+        self.use_object_obs = use_object_obs
+        self.placement_initializer = placement_initializer
+
+        # cube half-edges (m) -> 4 cubes, reasonable spacing
+        # largest -> large -> medium -> small
+        self.size_xlarge = 0.031
+        self.size_large = 0.028
+        self.size_med = 0.025
+        self.size_small = 0.022
+
+        # hole gate in container local frame
+        self.hole_x_min = 0.02
+        self.hole_x_max = 0.09
+        self.hole_y_abs = 0.035
+
+        # stacking tolerances
+        self.stack_xy_tol = 1.15  # * min(half_edge_i, half_edge_j)
+        self.stack_z_tol = 0.010  # |dz - (si+sj)|
+        self.pos_noise_std = 0.005
+        self.pos_bias_range = 0.004
+        self._pos_bias = np.zeros(3)
+
+        # dynamics randomization
+        self.friction_range = [0.6, 1.2]
+
+        # world calibration offset
+                # world calibration offset
+        self.world_xy_offset_range = [-0.005, 0.005]
+        self.heavy_dr = True
+
+# Observation noise: close to light, but variable
+        self.pos_noise_std_range = [0.003, 0.008]   # was [0.002, 0.025]
+
+        # Dynamics
+        self.cube_mass_scale_range = [0.9, 1.15]    # was [0.7, 1.5]
+        self.joint_damping_scale_range = [0.9, 1.15] # was [0.8, 1.5]
+        self.actuator_gain_scale_range = [0.95, 1.05] # was [0.85, 1.15]
+
+        # Friction
+        self.friction_range_heavy = [0.7, 1.3]      # was [0.3, 1.8]
+        self.torsional_friction_range = [0.003, 0.008]
+        self.rolling_friction_range = [0.0002, 0.0008]
+
+        # Observation/world perturbation
+        self.pos_bias_range_heavy = 0.005           # was 0.015
+        self.world_xy_offset_range_heavy = [-0.007, 0.007]  # was [-0.015, 0.015]
+
+        # Not implemented, so disable
+        self.obs_latency_range = [0, 0]             # was [0, 2]
+
+        # Initial stack perturbation
+        self.cube_xy_perturb_range = 0.002          # was 0.003
+
+        # Store base values after first reset
+        self._base_masses = None
+        self._base_damping = None
+        self._base_gains = None
+        self._base_geom_friction = None
+
+        # Strict Hanoi legality: terminate if a larger cube is placed on a smaller cube
+        self.terminate_on_illegal_stack = True
+        self.illegal_stack_term_thresh = 0.70  # continuous stack score threshold
+
+        super().__init__(
+            robots=robots,
+            env_configuration=env_configuration,
+            controller_configs=controller_configs,
+            base_types=base_types,
+            gripper_types=gripper_types,
+            initialization_noise=initialization_noise,
+            use_camera_obs=use_camera_obs,
+            has_renderer=has_renderer,
+            has_offscreen_renderer=has_offscreen_renderer,
+            render_camera=render_camera,
+            render_collision_mesh=render_collision_mesh,
+            render_visual_mesh=render_visual_mesh,
+            render_gpu_device_id=render_gpu_device_id,
+            control_freq=control_freq,
+            lite_physics=lite_physics,
+            horizon=horizon,
+            ignore_done=ignore_done,
+            hard_reset=hard_reset,
+            camera_names=camera_names,
+            camera_heights=camera_heights,
+            camera_widths=camera_widths,
+            camera_depths=camera_depths,
+            camera_segmentations=camera_segmentations,
+            renderer=renderer,
+            renderer_config=renderer_config,
+        )
+
+    # ----------------------------- LOAD MODEL -----------------------------
+
+    def _load_model(self):
+        super()._load_model()
+
+        mujoco_arena = TableArena(
+            table_full_size=self.table_full_size,
+            table_friction=self.table_friction,
+            table_offset=self.table_offset,
+        )
+        mujoco_arena.set_origin([0, 0, 0])
+
+        xpos = list(self.robots[0].robot_model.base_xpos_offset["table"](self.table_full_size[0]))
+        xpos[2] -= 0.1
+        self.robots[0].robot_model.set_base_xpos(xpos)
+
+        tex_attrib = {"type": "cube"}
+        mat_attrib = {"texrepeat": "1 1", "specular": "0.4", "shininess": "0.1"}
+        redwood = CustomMaterial(texture="WoodRed", tex_name="redwood", mat_name="redwood_mat",
+                                 tex_attrib=tex_attrib, mat_attrib=mat_attrib)
+        bluewood = CustomMaterial(texture="WoodBlue", tex_name="bluewood", mat_name="bluewood_mat",
+                                  tex_attrib=tex_attrib, mat_attrib=mat_attrib)
+        greenwood = CustomMaterial(texture="WoodGreen", tex_name="greenwood", mat_name="greenwood_mat",
+                                   tex_attrib=tex_attrib, mat_attrib=mat_attrib)
+        graywood = CustomMaterial(texture="WoodLight", tex_name="graywood", mat_name="graywood_mat",
+                                  tex_attrib=tex_attrib, mat_attrib=mat_attrib)
+
+        # Keep legacy names for compatibility:
+        # cube      -> smallest
+        # cube_blue -> medium
+        # cube_green-> large
+        # cube_xlarge -> new largest
+        self.cube_small = BoxObject(
+            name="cube",
+            size_min=[self.size_small, self.size_small, self.size_small],
+            size_max=[self.size_small, self.size_small, self.size_small],
+            rgba=[1, 0, 0, 1],
+            material=redwood,
+        )
+        self.cube_med = BoxObject(
+            name="cube_blue",
+            size_min=[self.size_med, self.size_med, self.size_med],
+            size_max=[self.size_med, self.size_med, self.size_med],
+            rgba=[0, 0.2, 1, 1],
+            material=bluewood,
+        )
+        self.cube_large = BoxObject(
+            name="cube_green",
+            size_min=[self.size_large, self.size_large, self.size_large],
+            size_max=[self.size_large, self.size_large, self.size_large],
+            rgba=[0.0, 0.7, 0.2, 1],
+            material=greenwood,
+        )
+        self.cube_xlarge = BoxObject(
+            name="cube_xlarge",
+            size_min=[self.size_xlarge, self.size_xlarge, self.size_xlarge],
+            size_max=[self.size_xlarge, self.size_xlarge, self.size_xlarge],
+            rgba=[0.65, 0.65, 0.65, 1],
+            material=graywood,
+        )
+
+        xml_obj = xml_path_completion("objects/plate-with-hole_bigger.xml")
+        self.box_A = MujocoXMLObject(xml_obj, name="container", joints="default")      # legacy name
+        self.box_B = MujocoXMLObject(xml_obj, name="container_B", joints="default")
+        self.box_C = MujocoXMLObject(xml_obj, name="container_C", joints="default")
+
+        self.objects = [
+            self.cube_small, self.cube_med, self.cube_large, self.cube_xlarge,
+            self.box_A, self.box_B, self.box_C
+        ]
+
+        self.model = ManipulationTask(
+            mujoco_arena=mujoco_arena,
+            mujoco_robots=[robot.robot_model for robot in self.robots],
+            mujoco_objects=self.objects,
+        )
+
+    # --------------------------- SETUP REFERENCES ---------------------------
+
+    def _setup_references(self):
+        super()._setup_references()
+
+        # cube bodies
+        self.cube_small_body_id = self.sim.model.body_name2id(self.cube_small.root_body)
+        self.cube_med_body_id = self.sim.model.body_name2id(self.cube_med.root_body)
+        self.cube_large_body_id = self.sim.model.body_name2id(self.cube_large.root_body)
+        self.cube_xlarge_body_id = self.sim.model.body_name2id(self.cube_xlarge.root_body)
+
+        # container bodies
+        self.box_A_body_id = self.sim.model.body_name2id(self.box_A.root_body)
+        self.box_B_body_id = self.sim.model.body_name2id(self.box_B.root_body)
+        self.box_C_body_id = self.sim.model.body_name2id(self.box_C.root_body)
+
+        # object joints (free joints)
+        self.cube_small_joint = self.cube_small.joints[0]
+        self.cube_med_joint = self.cube_med.joints[0]
+        self.cube_large_joint = self.cube_large.joints[0]
+        self.cube_xlarge_joint = self.cube_xlarge.joints[0]
+        self.box_A_joint = self.box_A.joints[0]
+        self.box_B_joint = self.box_B.joints[0]
+        self.box_C_joint = self.box_C.joints[0]
+
+    # --------------------------- OBSERVABLES ---------------------------
+
+    def _add_pos_noise(self, p):
+        return p + self._pos_bias + np.random.normal(0, self.pos_noise_std, size=3)
+
+    def _setup_observables(self):
+        observables = super()._setup_observables()
+
+        if not self.use_object_obs:
+            return observables
+
+        @sensor(modality="object")
+        def cube_pos(_):
+            p_small = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.cube_small_body_id]))
+            p_med = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.cube_med_body_id]))
+            p_large = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.cube_large_body_id]))
+            p_xlarge = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.cube_xlarge_body_id]))
+            return np.concatenate([p_small, p_med, p_large, p_xlarge])
+
+        @sensor(modality="object")
+        def cube_quat(_):
+            q_small = np.array(self.sim.data.body_xquat[self.cube_small_body_id])   # wxyz
+            q_med = np.array(self.sim.data.body_xquat[self.cube_med_body_id])
+            q_large = np.array(self.sim.data.body_xquat[self.cube_large_body_id])
+            q_xlarge = np.array(self.sim.data.body_xquat[self.cube_xlarge_body_id])
+            return np.concatenate([q_small, q_med, q_large, q_xlarge])
+
+        @sensor(modality="object")
+        def cube_size(_):
+            return np.array(
+                [self.size_small, self.size_med, self.size_large, self.size_xlarge],
+                dtype=np.float32,
+            )
+
+        @sensor(modality="object")
+        def box_pos(_):
+            pA = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.box_A_body_id]))
+            pB = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.box_B_body_id]))
+            pC = self._add_pos_noise(np.array(self.sim.data.body_xpos[self.box_C_body_id]))
+            return np.concatenate([pA, pB, pC])
+
+        @sensor(modality="object")
+        def box_quat(_):
+            qA = np.array(self.sim.data.body_xquat[self.box_A_body_id])
+            qB = np.array(self.sim.data.body_xquat[self.box_B_body_id])
+            qC = np.array(self.sim.data.body_xquat[self.box_C_body_id])
+            return np.concatenate([qA, qB, qC])
+
+        @sensor(modality="object")
+        def boxA_pos(_):
+            return np.array(self.sim.data.body_xpos[self.box_A_body_id])
+
+        @sensor(modality="object")
+        def boxB_pos(_):
+            return np.array(self.sim.data.body_xpos[self.box_B_body_id])
+
+        @sensor(modality="object")
+        def boxC_pos(_):
+            return np.array(self.sim.data.body_xpos[self.box_C_body_id])
+
+        @sensor(modality="object")
+        def boxA_quat(_):
+            return np.array(self.sim.data.body_xquat[self.box_A_body_id])
+
+        @sensor(modality="object")
+        def boxB_quat(_):
+            return np.array(self.sim.data.body_xquat[self.box_B_body_id])
+
+        @sensor(modality="object")
+        def boxC_quat(_):
+            return np.array(self.sim.data.body_xquat[self.box_C_body_id])
+
+        sensors = OrderedDict(
+            cube_pos=cube_pos,       # noisy (4x3 flattened)
+            cube_quat=cube_quat,     # 4x4 flattened
+            cube_size=cube_size,     # 4 half-edge sizes
+            boxes_pos=box_pos,       # noisy (3x3 flattened) -> A,B,C
+            boxes_quat=box_quat,     # 3x4 flattened -> A,B,C
+        )
+
+        for name, s in sensors.items():
+            observables[name] = Observable(
+                name=name,
+                sensor=s,
+                sampling_rate=self.control_freq,
+            )
+        for k in ["object-state", "robot0_proprio-state"]:
+            if k in observables:
+                observables.pop(k)
+        return observables
+
+    # --------------------------- RESET ---------------------------
+
+    def _reset_internal(self):
+        super()._reset_internal()
+
+        heavy = self.heavy_dr
+
+        # --- store base MuJoCo values on first call ---
+        # --- store base MuJoCo values on first call ---
+        if self._base_masses is None:
+            self._base_masses = self.sim.model.body_mass.copy()
+        if self._base_damping is None:
+            self._base_damping = self.sim.model.dof_damping.copy()
+        if self._base_gains is None:
+            self._base_gains = self.sim.model.actuator_gainprm.copy()
+        if self._base_geom_friction is None:
+            self._base_geom_friction = self.sim.model.geom_friction.copy()
+
+        # always restore base values first
+        self.sim.model.body_mass[:] = self._base_masses
+        self.sim.model.dof_damping[:] = self._base_damping
+        self.sim.model.actuator_gainprm[:] = self._base_gains
+        self.sim.model.geom_friction[:] = self._base_geom_friction
+
+        # --- friction (sliding) ---
+        fr = self.friction_range_heavy if heavy else self.friction_range
+        friction_scale = np.random.uniform(*fr)
+        self.sim.model.geom_friction[:, 0] = self._base_geom_friction[:, 0] * friction_scale
+
+        # --- friction (torsional + rolling) ---
+        if heavy:
+            self.sim.model.geom_friction[:, 1] = np.random.uniform(
+                self.torsional_friction_range[0],
+                self.torsional_friction_range[1],
+                size=self.sim.model.ngeom,
+            )
+            self.sim.model.geom_friction[:, 2] = np.random.uniform(
+                self.rolling_friction_range[0],
+                self.rolling_friction_range[1],
+                size=self.sim.model.ngeom,
+            )
+
+        # --- observation noise (per-episode) --- NEW
+        if heavy:
+            self.pos_noise_std = np.random.uniform(*self.pos_noise_std_range)
+        # else: keeps the fixed 0.005 from __init__
+
+        # --- observation bias ---
+        bias_range = self.pos_bias_range_heavy if heavy else self.pos_bias_range
+        self._pos_bias = np.random.uniform(-bias_range, bias_range, size=3)
+
+        # --- cube mass --- NEW
+        if heavy:
+            mass_scale = np.random.uniform(*self.cube_mass_scale_range)
+            for body_id in [self.cube_small_body_id, self.cube_med_body_id,
+                            self.cube_large_body_id, self.cube_xlarge_body_id]:
+                self.sim.model.body_mass[body_id] = self._base_masses[body_id] * mass_scale
+
+        # --- joint damping --- NEW
+        if heavy:
+            damp_scale = np.random.uniform(*self.joint_damping_scale_range)
+            self.sim.model.dof_damping[:] = self._base_damping * damp_scale
+
+        # --- actuator gains --- NEW
+        if heavy:
+            gain_scale = np.random.uniform(*self.actuator_gain_scale_range)
+            self.sim.model.actuator_gainprm[:] = self._base_gains * gain_scale
+
+        # --- observation latency --- NEW
+        if heavy:
+            self._obs_latency = np.random.randint(
+                self.obs_latency_range[0], self.obs_latency_range[1] + 1
+            )
+            self._obs_buffer = []
+        else:
+            self._obs_latency = 0
+            self._obs_buffer = []
+
+        # --- world offset ---
+        xy_range = self.world_xy_offset_range_heavy if heavy else self.world_xy_offset_range
+        world_offset = np.array([
+            np.random.uniform(*xy_range),
+            np.random.uniform(*xy_range),
+            0.0
+        ])
+
+        q_identity = np.array([1.0, 0.0, 0.0, 0.0])
+        table_z = float(self.table_offset[2])
+
+        pA = np.array([0.0, -0.25, table_z]) + world_offset
+        pB = np.array([0.0,  0.00, table_z]) + world_offset
+        pC = np.array([0.0,  0.25, table_z]) + world_offset
+
+        self.sim.data.set_joint_qpos(self.box_A_joint, np.concatenate([pA, q_identity]))
+        self.sim.data.set_joint_qpos(self.box_B_joint, np.concatenate([pB, q_identity]))
+        self.sim.data.set_joint_qpos(self.box_C_joint, np.concatenate([pC, q_identity]))
+
+        # --- cube initial positions (with optional perturbation) ---
+        base_xy = np.array([pA[0] + 0.055, pA[1] + 0.0])
+
+        z_xlarge = table_z + self.size_xlarge
+        z_large  = z_xlarge + (self.size_xlarge + self.size_large)
+        z_med    = z_large + (self.size_large + self.size_med)
+        z_small  = z_med + (self.size_med + self.size_small)
+
+        perturb = self.cube_xy_perturb_range if heavy else 0.0
+
+        for joint, z in [
+            (self.cube_xlarge_joint, z_xlarge),
+            (self.cube_large_joint, z_large),
+            (self.cube_med_joint, z_med),
+            (self.cube_small_joint, z_small),
+        ]:
+            xy = base_xy + np.random.uniform(-perturb, perturb, size=2)
+            self.sim.data.set_joint_qpos(joint, np.array([xy[0], xy[1], z, *q_identity]))
+
+        self.sim.forward()
+    # --------------------------- HELPERS ---------------------------
+
+    def reset(self):
+        self._prev_cube_pos = None
+        obs = super().reset()
+        self.reset_fitness()
+        return obs
+
+    def step(self, action):
+        obs, reward, done, info = super().step(action)
+
+        # keep your current dense fitness behavior
+        self.update_fitness()
+
+        # success termination (optional but helpful for debugging consistency)
+        if self._check_success():
+            done = True
+            info = dict(info) if info is not None else {}
+            info["terminated_reason"] = "success"
+            return obs, reward, done, info
+
+        # strict Hanoi legality termination: larger on smaller
+        if self.terminate_on_illegal_stack and (not done):
+            illegal_score = self._illegal_stack_score_now()
+            if illegal_score >= self.illegal_stack_term_thresh:
+                done = True
+                info = dict(info) if info is not None else {}
+                info["terminated_reason"] = "illegal_stack_larger_on_smaller"
+                info["illegal_stack_score"] = float(illegal_score)
+
+        return obs, reward, done, info
+
+    def _world_to_box_local(self, p_world, box_pos, box_quat_wxyz):
+        R = quat2mat(convert_quat(np.array(box_quat_wxyz), to="xyzw"))
+        return R.T @ (p_world - box_pos)
+
+    def _in_hole_xy(self, p_local):
+        return (self.hole_x_min <= p_local[0] <= self.hole_x_max) and (abs(p_local[1]) <= self.hole_y_abs)
+
+    def _stack_pair_ok(self, lower_pos, upper_pos, s_lower, s_upper):
+        dxy = np.linalg.norm(upper_pos[:2] - lower_pos[:2])
+        if dxy > self.stack_xy_tol * min(s_lower, s_upper):
+            return False
+        dz = float(upper_pos[2] - lower_pos[2])
+        if dz <= 0.0:
+            return False
+        return abs(dz - (s_lower + s_upper)) <= self.stack_z_tol
+
+    def _stack_pair_score_cont(self, lower_pos, upper_pos, s_lower, s_upper):
+        """
+        Continuous stack score in [0,1] for detecting illegal larger-on-smaller placement.
+        High score means 'upper' is stacked on 'lower'.
+        """
+        lower_pos = np.array(lower_pos, dtype=np.float64)
+        upper_pos = np.array(upper_pos, dtype=np.float64)
+
+        dxy = float(np.linalg.norm(upper_pos[:2] - lower_pos[:2]))
+        dz = float(upper_pos[2] - lower_pos[2])
+        dz_target = float(s_lower + s_upper)
+
+        xy_scale = float(self.stack_xy_tol * min(s_lower, s_upper) + 1e-12)
+        s_xy = np.exp(-dxy / xy_scale)
+
+        # smooth "upper above lower"
+        s_above = 1.0 / (1.0 + np.exp(-(dz - 0.002) / 0.002))
+        s_z = np.exp(-abs(dz - dz_target) / (self.stack_z_tol + 1e-12))
+
+        return float(np.clip(s_xy * s_z * s_above, 0.0, 1.0))
+
+    def _illegal_stack_score_now(self):
+        """
+        Detect illegal Hanoi placements: larger cube on smaller cube.
+        Returns max continuous illegal-stack score in [0,1].
+        4-cube version checks:
+          med on small
+          large on med
+          large on small
+          xlarge on large
+          xlarge on med
+          xlarge on small
+        """
+        p_small = np.array(self.sim.data.body_xpos[self.cube_small_body_id], dtype=np.float64)
+        p_med = np.array(self.sim.data.body_xpos[self.cube_med_body_id], dtype=np.float64)
+        p_large = np.array(self.sim.data.body_xpos[self.cube_large_body_id], dtype=np.float64)
+        p_xlarge = np.array(self.sim.data.body_xpos[self.cube_xlarge_body_id], dtype=np.float64)
+
+        scores = [
+            # medium on small
+            self._stack_pair_score_cont(p_small, p_med, self.size_small, self.size_med),
+
+            # large on smaller
+            self._stack_pair_score_cont(p_med, p_large, self.size_med, self.size_large),
+            self._stack_pair_score_cont(p_small, p_large, self.size_small, self.size_large),
+
+            # xlarge on smaller
+            self._stack_pair_score_cont(p_large, p_xlarge, self.size_large, self.size_xlarge),
+            self._stack_pair_score_cont(p_med, p_xlarge, self.size_med, self.size_xlarge),
+            self._stack_pair_score_cont(p_small, p_xlarge, self.size_small, self.size_xlarge),
+        ]
+        return float(max(scores))
+
+    # --------------------------- SUCCESS ---------------------------
+
+    def _check_success(self):
+        # cube positions
+        p_small = np.array(self.sim.data.body_xpos[self.cube_small_body_id])
+        p_med = np.array(self.sim.data.body_xpos[self.cube_med_body_id])
+        p_large = np.array(self.sim.data.body_xpos[self.cube_large_body_id])
+        p_xlarge = np.array(self.sim.data.body_xpos[self.cube_xlarge_body_id])
+
+        # containers
+        pC = np.array(self.sim.data.body_xpos[self.box_C_body_id])
+        qC = np.array(self.sim.data.body_xquat[self.box_C_body_id])
+        pA = np.array(self.sim.data.body_xpos[self.box_A_body_id])
+        qA = np.array(self.sim.data.body_xquat[self.box_A_body_id])
+        pB = np.array(self.sim.data.body_xpos[self.box_B_body_id])
+        qB = np.array(self.sim.data.body_xquat[self.box_B_body_id])
+
+        def in_container(p_obj, p_box, q_box):
+            p_local = self._world_to_box_local(p_obj, p_box, q_box)
+            return self._in_hole_xy(p_local)
+
+        inC_small = in_container(p_small, pC, qC)
+        inC_med = in_container(p_med, pC, qC)
+        inC_large = in_container(p_large, pC, qC)
+        inC_xlarge = in_container(p_xlarge, pC, qC)
+
+        # target must contain all four
+        if not (inC_small and inC_med and inC_large and inC_xlarge):
+            return False
+
+        # A and B must contain none
+        for p in [p_small, p_med, p_large, p_xlarge]:
+            if in_container(p, pA, qA):
+                return False
+            if in_container(p, pB, qB):
+                return False
+
+        # correct order on C: xlarge -> large -> med -> small
+        if not self._stack_pair_ok(p_xlarge, p_large, self.size_xlarge, self.size_large):
+            return False
+        if not self._stack_pair_ok(p_large, p_med, self.size_large, self.size_med):
+            return False
+        if not self._stack_pair_ok(p_med, p_small, self.size_med, self.size_small):
+            return False
+
+        return True
+
+
+    def _debug_force_illegal(self, upper: str = "large", lower: str = "small"):
+        """
+        Force an illegal stack by placing a larger cube ('upper') on top of a smaller cube ('lower')
+        over container C. Used for termination debugging.
+
+        Valid names: "small", "med", "large", "xlarge"
+        Illegal examples:
+        med on small
+        large on med
+        large on small
+        xlarge on large
+        xlarge on med
+        xlarge on small
+        """
+        q = np.array([1.0, 0.0, 0.0, 0.0])  # wxyz
+        table_z = float(self.table_offset[2])
+
+        pC = np.array(self.sim.data.body_xpos[self.box_C_body_id])
+        base_xy = np.array([pC[0] + 0.055, pC[1]])
+
+        # map names -> joints / sizes
+        joint_map = {
+            "small": self.cube_small_joint,
+            "med": self.cube_med_joint,
+            "large": self.cube_large_joint,
+            "xlarge": self.cube_xlarge_joint,
+        }
+        size_map = {
+            "small": self.size_small,
+            "med": self.size_med,
+            "large": self.size_large,
+            "xlarge": self.size_xlarge,
+        }
+
+        assert upper in joint_map and lower in joint_map, f"Invalid names: {upper}, {lower}"
+
+        # Put all cubes in a safe separated layout first (avoid accidental extra stacks)
+        # A, B, C row-ish placements
+        pA = np.array(self.sim.data.body_xpos[self.box_A_body_id])
+        pB = np.array(self.sim.data.body_xpos[self.box_B_body_id])
+
+        safe_xy = {
+            "small": np.array([pA[0] + 0.055, pA[1]]),
+            "med":   np.array([pB[0] + 0.055, pB[1]]),
+            "large": np.array([pC[0] - 0.08,  pC[1]]),
+            "xlarge":np.array([pC[0] - 0.14,  pC[1]]),
+        }
+
+        for name in ["small", "med", "large", "xlarge"]:
+            z = table_z + size_map[name]
+            self.sim.data.set_joint_qpos(
+                joint_map[name],
+                np.array([safe_xy[name][0], safe_xy[name][1], z, *q], dtype=np.float64)
+            )
+
+        # Now force the illegal pair over C
+        z_lower = table_z + size_map[lower]
+        z_upper = z_lower + (size_map[lower] + size_map[upper])
+
+        self.sim.data.set_joint_qpos(
+            joint_map[lower],
+            np.array([base_xy[0], base_xy[1], z_lower, *q], dtype=np.float64)
+        )
+        self.sim.data.set_joint_qpos(
+            joint_map[upper],
+            np.array([base_xy[0], base_xy[1], z_upper, *q], dtype=np.float64)
+        )
+
+        self.sim.forward()
+
+    def _debug_force_success(self):
+        q = np.array([1.0, 0.0, 0.0, 0.0])  # wxyz
+        table_z = float(self.table_offset[2])
+        pC = np.array(self.sim.data.body_xpos[self.box_C_body_id])
+
+        base_xy = np.array([pC[0] + 0.055, pC[1]])
+
+        z_xlarge = table_z + self.size_xlarge
+        z_large = z_xlarge + (self.size_xlarge + self.size_large)
+        z_med = z_large + (self.size_large + self.size_med)
+        z_small = z_med + (self.size_med + self.size_small)
+
+        self.sim.data.set_joint_qpos(self.cube_xlarge_joint, np.array([base_xy[0], base_xy[1], z_xlarge, *q]))
+        self.sim.data.set_joint_qpos(self.cube_large_joint,  np.array([base_xy[0], base_xy[1], z_large,  *q]))
+        self.sim.data.set_joint_qpos(self.cube_med_joint,    np.array([base_xy[0], base_xy[1], z_med,    *q]))
+        self.sim.data.set_joint_qpos(self.cube_small_joint,  np.array([base_xy[0], base_xy[1], z_small,  *q]))
+        self.sim.forward()
+
+    # --------------------------- TASK DESCRIPTION ---------------------------
+
+    def task_description(self) -> str:
+        return (
+        "Tower of Hanoi with 4 cubes and 3 containers (A, B, C). "
+        "Cubes have different sizes: extra-large (gray), large (green), medium (blue), and small (red). "
+        "At reset, all four cubes are stacked on container A in correct order: extra-large at the bottom, "
+        "then large, medium, and small on top. "
+        "The goal is to move the full tower to container C, preserving the same size order "
+        "(extra-large -> large -> medium -> small), while leaving containers A and B empty. "
+        "Illegal Hanoi placements are not allowed: a larger cube placed on top of a smaller cube terminates the episode."
+        )
+
+    # ------------------------------- REWARD -------------------------------
+
+    def reward(self, action=None):
+        return 1.0 if self._check_success() else 0.0
+
+
+
+Return the full class with the full logic impleneted.

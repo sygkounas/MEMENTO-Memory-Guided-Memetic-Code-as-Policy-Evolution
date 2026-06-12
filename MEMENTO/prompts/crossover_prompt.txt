@@ -1,0 +1,631 @@
+Your task is to apply a **STRUCTURAL CROSSOVER**: synthesize a new algorithm by integrating
+complementary internal components from **two parent policies as code**
+You must identify which internal mechanisms of each parent are strong or weak based on their
+reported metrics and fitness, and selectively recombine the strongest modules into a single
+coherent policy as code algorithm. 
+
+Crossover is **directed**, not random: differences in performance across parents must guide
+which parts you preserve, replace, or merge. You may blend, unify, or re-architect internal components,
+but theclass name, method names, must remain unchanged.
+
+Current task:
+def task_description(self) -> str:
+    return (
+        "Tower of Hanoi with 4 cubes and 3 containers (A, B, C). "
+        "Cubes have different sizes: extra-large (gray), large (green), medium (blue), and small (red). "
+        "At reset, all four cubes are stacked on container A in correct order: extra-large at the bottom, "
+        "then large, medium, and small on top. "
+        "The goal is to move the full tower to container C, preserving the same size order "
+        "(extra-large -> large -> medium -> small), while leaving containers A and B empty. "
+        "Illegal Hanoi placements are not allowed: a larger cube placed on top of a smaller cube terminates the episode."
+    )
+---
+Code as policy first:
+python '''
+{policy_code1}
+'''
+
+### Historical Metrics
+{Metrics1}
+
+### Fitness Summary
+{Fitness1}
+
+Code as policy second:
+python '''
+{policy_code2}
+'''
+
+### Historical Metrics
+{Metrics2}
+
+### Fitness Summary
+{Fitness2}
+
+
+Fitness function of the environemnt (policy only takes observation as input this is provided as help to interpret the metrics!
+def reset_fitness(self):
+        self._fitness_state = {
+            "steps": 0,
+            "sum_composite": 0.0,
+            "sum_interaction_quality": 0.0,
+
+            "max_composite": 0.0,
+            "max_reach": 0.0,
+            "max_grasp": 0.0,
+            "max_transport": 0.0,
+            "max_place": 0.0,
+            "max_arrangement": 0.0,
+
+            "last": {},
+
+            "min_eef_to_cube_dist": {
+                "small": float("inf"),
+                "med": float("inf"),
+                "large": float("inf"),
+                "xlarge": float("inf"),
+            },
+            "max_lift_height": {"small": 0.0, "med": 0.0, "large": 0.0, "xlarge": 0.0},
+            "sum_cube_speed": {"small": 0.0, "med": 0.0, "large": 0.0, "xlarge": 0.0},
+
+            "drop_count": 0,
+            "illegal_stack_max": 0.0,
+
+            "t_first_reach": None,
+            "t_first_lift": None,
+            "t_first_cube_in_C": None,
+            "t_first_two_in_C": None,
+            "t_first_all_in_C": None,
+        }
+
+        self._fitness_prev = {
+            "eef_pos": None,
+            "lift_h": {"small": 0.0, "med": 0.0, "large": 0.0, "xlarge": 0.0},
+        }
+
+        try:
+            robot = self.robots[0]
+            if hasattr(robot, "eef_pos"):
+                self._fitness_prev["eef_pos"] = np.array(robot.eef_pos, dtype=np.float64)
+            else:
+                site_id = self.sim.model.site_name2id("gripper0_right_grip_site")
+                self._fitness_prev["eef_pos"] = np.array(self.sim.data.site_xpos[site_id], dtype=np.float64)
+        except Exception:
+            self._fitness_prev["eef_pos"] = None
+
+    def update_fitness(self):
+        fs = self._fitness_state
+        fs["steps"] += 1
+        t = fs["steps"]
+
+        def _safe_clip01(x):
+            return float(np.clip(x, 0.0, 1.0))
+
+        def _exp_score(dist, scale):
+            return float(np.exp(-float(dist) / (float(scale) + 1e-12)))
+
+        def _eef_pos():
+            robot = self.robots[0]
+            if hasattr(robot, "eef_pos"):
+                return np.array(robot.eef_pos, dtype=np.float64)
+            if hasattr(robot, "ee_pos"):
+                return np.array(robot.ee_pos, dtype=np.float64)
+            try:
+                site_id = self.sim.model.site_name2id("gripper0_right_grip_site")
+                return np.array(self.sim.data.site_xpos[site_id], dtype=np.float64)
+            except Exception:
+                return np.array(self.sim.data.body_xpos[self.robots[0].robot_model.root_body_id], dtype=np.float64)
+
+        def _hole_score(p_obj_world, p_box_world, q_box_wxyz):
+            p_local = self._world_to_box_local(np.array(p_obj_world), np.array(p_box_world), np.array(q_box_wxyz))
+            x = float(p_local[0])
+            y = float(p_local[1])
+
+            x_c = 0.5 * (self.hole_x_min + self.hole_x_max)
+            hx = 0.5 * (self.hole_x_max - self.hole_x_min)
+            hy = float(self.hole_y_abs)
+
+            dx_out = max(0.0, abs(x - x_c) - hx)
+            dy_out = max(0.0, abs(y) - hy)
+            outside = (dx_out * dx_out + dy_out * dy_out) ** 0.5
+
+            cx = (x - x_c) / (hx + 1e-12)
+            cy = y / (hy + 1e-12)
+            center_score = np.exp(-0.5 * (cx * cx + cy * cy))
+            outside_score = np.exp(-outside / 0.008)
+
+            return float(np.clip(center_score * outside_score, 0.0, 1.0))
+
+        def _stack_pair_score(lower_pos, upper_pos, s_lower, s_upper):
+            lower_pos = np.array(lower_pos, dtype=np.float64)
+            upper_pos = np.array(upper_pos, dtype=np.float64)
+
+            dxy = float(np.linalg.norm(upper_pos[:2] - lower_pos[:2]))
+            dz = float(upper_pos[2] - lower_pos[2])
+            dz_target = float(s_lower + s_upper)
+
+            xy_scale = float(self.stack_xy_tol * min(s_lower, s_upper) + 1e-12)
+            s_xy = np.exp(-dxy / xy_scale)
+
+            s_above = 1.0 / (1.0 + np.exp(-(dz - 0.002) / 0.002))
+            s_z = np.exp(-abs(dz - dz_target) / (self.stack_z_tol + 1e-12))
+
+            return float(np.clip(s_xy * s_z * s_above, 0.0, 1.0))
+
+        table_z = float(self.table_offset[2])
+
+        # 4-cube dense fitness
+        p_small = np.array(self.sim.data.body_xpos[self.cube_small_body_id], dtype=np.float64)
+        p_med = np.array(self.sim.data.body_xpos[self.cube_med_body_id], dtype=np.float64)
+        p_large = np.array(self.sim.data.body_xpos[self.cube_large_body_id], dtype=np.float64)
+        p_xlarge = np.array(self.sim.data.body_xpos[self.cube_xlarge_body_id], dtype=np.float64)
+
+        pA = np.array(self.sim.data.body_xpos[self.box_A_body_id], dtype=np.float64)
+        qA = np.array(self.sim.data.body_xquat[self.box_A_body_id], dtype=np.float64)
+        pB = np.array(self.sim.data.body_xpos[self.box_B_body_id], dtype=np.float64)
+        qB = np.array(self.sim.data.body_xquat[self.box_B_body_id], dtype=np.float64)
+        pC = np.array(self.sim.data.body_xpos[self.box_C_body_id], dtype=np.float64)
+        qC = np.array(self.sim.data.body_xquat[self.box_C_body_id], dtype=np.float64)
+
+        eef = _eef_pos()
+
+        eef_speed = 0.0
+        if self._fitness_prev["eef_pos"] is not None:
+            eef_speed = float(np.linalg.norm(eef - self._fitness_prev["eef_pos"]) * self.control_freq)
+        self._fitness_prev["eef_pos"] = eef
+
+        dt = 1.0 / self.control_freq
+
+        if self._prev_cube_pos is None:
+            self._prev_cube_pos = {
+                "small": p_small.copy(),
+                "med": p_med.copy(),
+                "large": p_large.copy(),
+                "xlarge": p_xlarge.copy(),
+            }
+
+        v_small = (p_small - self._prev_cube_pos["small"]) / dt
+        v_med = (p_med - self._prev_cube_pos["med"]) / dt
+        v_large = (p_large - self._prev_cube_pos["large"]) / dt
+        v_xlarge = (p_xlarge - self._prev_cube_pos["xlarge"]) / dt
+
+        self._prev_cube_pos["small"] = p_small.copy()
+        self._prev_cube_pos["med"] = p_med.copy()
+        self._prev_cube_pos["large"] = p_large.copy()
+        self._prev_cube_pos["xlarge"] = p_xlarge.copy()
+
+        sp_small = float(np.linalg.norm(v_small))
+        sp_med = float(np.linalg.norm(v_med))
+        sp_large = float(np.linalg.norm(v_large))
+        sp_xlarge = float(np.linalg.norm(v_xlarge))
+
+        fs["sum_cube_speed"]["small"] += sp_small
+        fs["sum_cube_speed"]["med"] += sp_med
+        fs["sum_cube_speed"]["large"] += sp_large
+        fs["sum_cube_speed"]["xlarge"] += sp_xlarge
+
+        mean_cube_speed = (sp_small + sp_med + sp_large + sp_xlarge) / 4.0
+
+        d_small = float(np.linalg.norm(eef - p_small))
+        d_med = float(np.linalg.norm(eef - p_med))
+        d_large = float(np.linalg.norm(eef - p_large))
+        d_xlarge = float(np.linalg.norm(eef - p_xlarge))
+
+        fs["min_eef_to_cube_dist"]["small"] = min(fs["min_eef_to_cube_dist"]["small"], d_small)
+        fs["min_eef_to_cube_dist"]["med"] = min(fs["min_eef_to_cube_dist"]["med"], d_med)
+        fs["min_eef_to_cube_dist"]["large"] = min(fs["min_eef_to_cube_dist"]["large"], d_large)
+        fs["min_eef_to_cube_dist"]["xlarge"] = min(fs["min_eef_to_cube_dist"]["xlarge"], d_xlarge)
+
+        reach_small = _exp_score(d_small, 0.12)
+        reach_med = _exp_score(d_med, 0.12)
+        reach_large = _exp_score(d_large, 0.12)
+        reach_xlarge = _exp_score(d_xlarge, 0.12)
+        approach_score = max(reach_small, reach_med, reach_large, reach_xlarge)
+
+        lh_small = float(p_small[2] - (table_z + self.size_small))
+        lh_med = float(p_med[2] - (table_z + self.size_med))
+        lh_large = float(p_large[2] - (table_z + self.size_large))
+        lh_xlarge = float(p_xlarge[2] - (table_z + self.size_xlarge))
+
+        fs["max_lift_height"]["small"] = max(fs["max_lift_height"]["small"], lh_small)
+        fs["max_lift_height"]["med"] = max(fs["max_lift_height"]["med"], lh_med)
+        fs["max_lift_height"]["large"] = max(fs["max_lift_height"]["large"], lh_large)
+        fs["max_lift_height"]["xlarge"] = max(fs["max_lift_height"]["xlarge"], lh_xlarge)
+
+        lift_small = _safe_clip01(lh_small / 0.08)
+        lift_med = _safe_clip01(lh_med / 0.08)
+        lift_large = _safe_clip01(lh_large / 0.08)
+        lift_xlarge = _safe_clip01(lh_xlarge / 0.08)
+        grasp_score = max(lift_small, lift_med, lift_large, lift_xlarge)
+
+        def _drop_event(lh_now, lh_prev, v_z):
+            return (lh_prev > 0.035) and (lh_now < 0.015) and (v_z < -0.25)
+
+        if _drop_event(lh_small, self._fitness_prev["lift_h"]["small"], float(v_small[2])):
+            fs["drop_count"] += 1
+        if _drop_event(lh_med, self._fitness_prev["lift_h"]["med"], float(v_med[2])):
+            fs["drop_count"] += 1
+        if _drop_event(lh_large, self._fitness_prev["lift_h"]["large"], float(v_large[2])):
+            fs["drop_count"] += 1
+        if _drop_event(lh_xlarge, self._fitness_prev["lift_h"]["xlarge"], float(v_xlarge[2])):
+            fs["drop_count"] += 1
+
+        self._fitness_prev["lift_h"]["small"] = lh_small
+        self._fitness_prev["lift_h"]["med"] = lh_med
+        self._fitness_prev["lift_h"]["large"] = lh_large
+        self._fitness_prev["lift_h"]["xlarge"] = lh_xlarge
+
+        x_c = 0.5 * (self.hole_x_min + self.hole_x_max)
+
+        def _xy_err_to_C(p_obj):
+            p_local_C = self._world_to_box_local(np.array(p_obj), pC, qC)
+            ex = float(p_local_C[0] - x_c)
+            ey = float(p_local_C[1] - 0.0)
+            return float((ex * ex + ey * ey) ** 0.5), p_local_C
+
+        err_small, _ = _xy_err_to_C(p_small)
+        err_med, _ = _xy_err_to_C(p_med)
+        err_large, _ = _xy_err_to_C(p_large)
+        err_xlarge, _ = _xy_err_to_C(p_xlarge)
+
+        trans_small = _exp_score(err_small, 0.18)
+        trans_med = _exp_score(err_med, 0.18)
+        trans_large = _exp_score(err_large, 0.18)
+        trans_xlarge = _exp_score(err_xlarge, 0.18)
+
+        transport_score = max(
+            lift_small * trans_small,
+            lift_med * trans_med,
+            lift_large * trans_large,
+            lift_xlarge * trans_xlarge,
+        )
+
+        hA_small = _hole_score(p_small, pA, qA)
+        hA_med = _hole_score(p_med, pA, qA)
+        hA_large = _hole_score(p_large, pA, qA)
+        hA_xlarge = _hole_score(p_xlarge, pA, qA)
+
+        hB_small = _hole_score(p_small, pB, qB)
+        hB_med = _hole_score(p_med, pB, qB)
+        hB_large = _hole_score(p_large, pB, qB)
+        hB_xlarge = _hole_score(p_xlarge, pB, qB)
+
+        hC_small = _hole_score(p_small, pC, qC)
+        hC_med = _hole_score(p_med, pC, qC)
+        hC_large = _hole_score(p_large, pC, qC)
+        hC_xlarge = _hole_score(p_xlarge, pC, qC)
+
+        C_fill = (hC_small + hC_med + hC_large + hC_xlarge) / 4.0
+        A_empty = 1.0 - (hA_small + hA_med + hA_large + hA_xlarge) / 4.0
+        B_empty = 1.0 - (hB_small + hB_med + hB_large + hB_xlarge) / 4.0
+        emptiness = _safe_clip01(0.5 * (A_empty + B_empty))
+        place_score = _safe_clip01(0.75 * C_fill + 0.25 * emptiness)
+
+        if fs["t_first_reach"] is None and approach_score > 0.8:
+            fs["t_first_reach"] = t
+        if fs["t_first_lift"] is None and grasp_score > 0.4:
+            fs["t_first_lift"] = t
+        n_in_C = int((hC_small > 0.7) + (hC_med > 0.7) + (hC_large > 0.7) + (hC_xlarge > 0.7))
+        if fs["t_first_cube_in_C"] is None and n_in_C >= 1:
+            fs["t_first_cube_in_C"] = t
+        if fs["t_first_two_in_C"] is None and n_in_C >= 2:
+            fs["t_first_two_in_C"] = t
+        if fs["t_first_all_in_C"] is None and n_in_C >= 4:
+            fs["t_first_all_in_C"] = t
+
+        # 4-cube target stack on C: xlarge -> large -> med -> small
+        z_goal_xlarge = table_z + self.size_xlarge
+        z_goal_large = z_goal_xlarge + (self.size_xlarge + self.size_large)
+        z_goal_med = z_goal_large + (self.size_large + self.size_med)
+        z_goal_small = z_goal_med + (self.size_med + self.size_small)
+
+        def _goal_pose_score(hC, err_xy, z_now, z_goal, size_half):
+            xy = np.exp(-float(err_xy) / (0.018 + 0.5 * float(size_half)))
+            zz = np.exp(-abs(float(z_now) - float(z_goal)) / 0.02)
+            return float(np.clip(hC * xy * zz, 0.0, 1.0))
+
+        goal_xlarge = _goal_pose_score(hC_xlarge, err_xlarge, p_xlarge[2], z_goal_xlarge, self.size_xlarge)
+        goal_large = _goal_pose_score(hC_large, err_large, p_large[2], z_goal_large, self.size_large)
+        goal_med = _goal_pose_score(hC_med, err_med, p_med[2], z_goal_med, self.size_med)
+        goal_small = _goal_pose_score(hC_small, err_small, p_small[2], z_goal_small, self.size_small)
+
+        stack_XL_L = _stack_pair_score(p_xlarge, p_large, self.size_xlarge, self.size_large)
+        stack_LM = _stack_pair_score(p_large, p_med, self.size_large, self.size_med)
+        stack_MS = _stack_pair_score(p_med, p_small, self.size_med, self.size_small)
+
+        mean_goal = (goal_xlarge + goal_large + goal_med + goal_small) / 4.0
+        arrangement_score = _safe_clip01(
+            0.50 * mean_goal + 0.1666667 * stack_XL_L + 0.1666667 * stack_LM + 0.1666667 * stack_MS
+        )
+
+        # illegal larger-on-smaller diagnostics (4-cube)
+        illegal_MS = _stack_pair_score(p_small, p_med, self.size_small, self.size_med)
+        illegal_LM = _stack_pair_score(p_med, p_large, self.size_med, self.size_large)
+        illegal_LS = _stack_pair_score(p_small, p_large, self.size_small, self.size_large)
+        illegal_XL_L = _stack_pair_score(p_large, p_xlarge, self.size_large, self.size_xlarge)
+        illegal_XL_M = _stack_pair_score(p_med, p_xlarge, self.size_med, self.size_xlarge)
+        illegal_XL_S = _stack_pair_score(p_small, p_xlarge, self.size_small, self.size_xlarge)
+
+        illegal_now = float(max(illegal_MS, illegal_LM, illegal_LS, illegal_XL_L, illegal_XL_M, illegal_XL_S))
+        fs["illegal_stack_max"] = max(fs["illegal_stack_max"], illegal_now)
+
+        iq_eef = 1.0 - np.clip(eef_speed / 1.5, 0.0, 1.0)
+        iq_cube = 1.0 - np.clip(mean_cube_speed / 1.0, 0.0, 1.0)
+        interaction_quality = _safe_clip01(0.6 * iq_eef + 0.4 * iq_cube)
+
+        w_app, w_grasp, w_trans, w_place, w_arr = 0.14, 0.18, 0.20, 0.20, 0.28
+        composite = (
+            w_app * approach_score
+            + w_grasp * grasp_score
+            + w_trans * transport_score
+            + w_place * place_score
+            + w_arr * arrangement_score
+        )
+
+        composite *= (1.0 - 0.15 * illegal_now)
+        composite = _safe_clip01(0.95 * composite + 0.05 * interaction_quality)
+
+        fs["sum_composite"] += composite
+        fs["sum_interaction_quality"] += interaction_quality
+
+        fs["max_composite"] = max(fs["max_composite"], composite)
+        fs["max_reach"] = max(fs["max_reach"], approach_score)
+        fs["max_grasp"] = max(fs["max_grasp"], grasp_score)
+        fs["max_transport"] = max(fs["max_transport"], transport_score)
+        fs["max_place"] = max(fs["max_place"], place_score)
+        fs["max_arrangement"] = max(fs["max_arrangement"], arrangement_score)
+
+        fs["last"] = {
+            "composite": float(composite),
+            "approach": float(approach_score),
+            "grasp": float(grasp_score),
+            "transport": float(transport_score),
+            "place": float(place_score),
+            "arrangement": float(arrangement_score),
+            "interaction_quality": float(interaction_quality),
+
+            "eef_speed": float(eef_speed),
+            "mean_cube_speed": float(mean_cube_speed),
+
+            "hole_A": {"small": float(hA_small), "med": float(hA_med), "large": float(hA_large), "xlarge": float(hA_xlarge)},
+            "hole_B": {"small": float(hB_small), "med": float(hB_med), "large": float(hB_large), "xlarge": float(hB_xlarge)},
+            "hole_C": {"small": float(hC_small), "med": float(hC_med), "large": float(hC_large), "xlarge": float(hC_xlarge)},
+            "C_fill": float(C_fill),
+            "A_empty": float(_safe_clip01(A_empty)),
+            "B_empty": float(_safe_clip01(B_empty)),
+            "emptiness": float(emptiness),
+
+            "xy_err_to_C": {"small": float(err_small), "med": float(err_med), "large": float(err_large), "xlarge": float(err_xlarge)},
+            "goal_pose": {"small": float(goal_small), "med": float(goal_med), "large": float(goal_large), "xlarge": float(goal_xlarge)},
+            "stack_scores": {"XL_on_L": float(stack_XL_L), "L_on_M": float(stack_LM), "M_on_S": float(stack_MS)},
+            "illegal_now": float(illegal_now),
+
+            "reach_dists": {"small": float(d_small), "med": float(d_med), "large": float(d_large), "xlarge": float(d_xlarge)},
+            "lift_heights": {"small": float(lh_small), "med": float(lh_med), "large": float(lh_large), "xlarge": float(lh_xlarge)},
+        }
+
+    def get_episode_fitness(self):
+        fs = self._fitness_state
+        steps = max(1, int(fs.get("steps", 0)))
+
+        auc = float(fs["sum_composite"] / steps)
+        max_comp = float(fs["max_composite"])
+        last_arr = float(fs["last"].get("arrangement", 0.0)) if fs.get("last") else 0.0
+
+        episode_fitness = float(np.clip(0.45 * auc + 0.45 * max_comp + 0.10 * last_arr, 0.0, 1.0))
+
+        success = bool(self._check_success())
+        if success:
+            episode_fitness = 1.0
+
+        metrics = {
+            "success": success,
+            "steps": steps,
+            "fitness_auc_composite": auc,
+            "fitness_max_composite": max_comp,
+            "fitness_last_composite": float(fs["last"].get("composite", 0.0)) if fs.get("last") else 0.0,
+            "episode_fitness": episode_fitness,
+            "max_phase_scores": {
+                "approach": float(fs["max_reach"]),
+                "grasp_lift": float(fs["max_grasp"]),
+                "transport": float(fs["max_transport"]),
+                "placement": float(fs["max_place"]),
+                "arrangement": float(fs["max_arrangement"]),
+            },
+            "last_phase_scores": {
+                "approach": float(fs["last"].get("approach", 0.0)) if fs.get("last") else 0.0,
+                "grasp_lift": float(fs["last"].get("grasp", 0.0)) if fs.get("last") else 0.0,
+                "transport": float(fs["last"].get("transport", 0.0)) if fs.get("last") else 0.0,
+                "placement": float(fs["last"].get("place", 0.0)) if fs.get("last") else 0.0,
+                "arrangement": float(fs["last"].get("arrangement", 0.0)) if fs.get("last") else 0.0,
+            },
+            "milestones": {
+                "t_first_reach": fs["t_first_reach"],
+                "t_first_lift": fs["t_first_lift"],
+                "t_first_cube_in_C": fs["t_first_cube_in_C"],
+                "t_first_two_in_C": fs["t_first_two_in_C"],
+                "t_first_all_in_C": fs["t_first_all_in_C"],
+            },
+            "interaction_quality": {
+                "mean": float(fs["sum_interaction_quality"] / steps),
+                "last": float(fs["last"].get("interaction_quality", 0.0)) if fs.get("last") else 0.0,
+                "drop_count": int(fs["drop_count"]),
+                "illegal_stack_max": float(fs["illegal_stack_max"]),
+                "last_eef_speed": float(fs["last"].get("eef_speed", 0.0)) if fs.get("last") else 0.0,
+                "last_mean_cube_speed": float(fs["last"].get("mean_cube_speed", 0.0)) if fs.get("last") else 0.0,
+            },
+            "reach": {
+                "min_eef_to_cube_dist": {
+                    "small": float(fs["min_eef_to_cube_dist"]["small"]),
+                    "med": float(fs["min_eef_to_cube_dist"]["med"]),
+                    "large": float(fs["min_eef_to_cube_dist"]["large"]),
+                    "xlarge": float(fs["min_eef_to_cube_dist"]["xlarge"]),
+                },
+                "last_eef_to_cube_dist": (fs["last"].get("reach_dists", {}) if fs.get("last") else {}),
+            },
+            "grasp_lift": {
+                "max_lift_height": {
+                    "small": float(fs["max_lift_height"]["small"]),
+                    "med": float(fs["max_lift_height"]["med"]),
+                    "large": float(fs["max_lift_height"]["large"]),
+                    "xlarge": float(fs["max_lift_height"]["xlarge"]),
+                },
+                "last_lift_heights": (fs["last"].get("lift_heights", {}) if fs.get("last") else {}),
+            },
+            "transport": {
+                "last_xy_err_to_C_center": (fs["last"].get("xy_err_to_C", {}) if fs.get("last") else {}),
+                "mean_cube_speed": {
+                    "small": float(fs["sum_cube_speed"]["small"] / steps),
+                    "med": float(fs["sum_cube_speed"]["med"] / steps),
+                    "large": float(fs["sum_cube_speed"]["large"] / steps),
+                    "xlarge": float(fs["sum_cube_speed"]["xlarge"] / steps),
+                },
+            },
+            "containers": {
+                "last_hole_scores_A": (fs["last"].get("hole_A", {}) if fs.get("last") else {}),
+                "last_hole_scores_B": (fs["last"].get("hole_B", {}) if fs.get("last") else {}),
+                "last_hole_scores_C": (fs["last"].get("hole_C", {}) if fs.get("last") else {}),
+                "last_C_fill": float(fs["last"].get("C_fill", 0.0)) if fs.get("last") else 0.0,
+                "last_A_empty": float(fs["last"].get("A_empty", 0.0)) if fs.get("last") else 0.0,
+                "last_B_empty": float(fs["last"].get("B_empty", 0.0)) if fs.get("last") else 0.0,
+            },
+            "arrangement": {
+                "last_goal_pose_scores": (fs["last"].get("goal_pose", {}) if fs.get("last") else {}),
+                "last_stack_pair_scores": (fs["last"].get("stack_scores", {}) if fs.get("last") else {}),
+            },
+        }
+
+        return episode_fitness, metrics
+
+INSTRUCTIONS:
+
+Return actions as a 7D vector:
+  [dx, dy, dz, droll, dpitch, dyaw, gripper]
+Each element must be in [-1, 1].
+
+- [dx, dy, dz] are end-effector delta commands (small increments).
+- [droll, dpitch, dyaw] are orientation deltas in axis-angle form.
+- gripper is a scalar:
+    > 0  closes (close threshold ~ +0.04)
+    < 0  opens  (open  threshold ~ -0.04)
+    = 0  holds
+
+Episode lifecycle:
+- Each episode calls `FrankaPolicy.reset()` before it begins.
+- `compute_action(self, obs)` is called every control step.
+- After task success, return a safe idle action (e.g., zeros with gripper hold).
+
+-------------------------------------------------------------------------------
+======================================================================
+6) Observation Space
+======================================================================
+
+Use these slices (fixed and stable for this environment version):
+
+Cubes:
+- small_pos   = obs["cube_pos"][0:3]
+- med_pos     = obs["cube_pos"][3:6]
+- large_pos   = obs["cube_pos"][6:9]
+- xlarge_pos  = obs["cube_pos"][9:12]
+
+- small_quat  = obs["cube_quat"][0:4]
+- med_quat    = obs["cube_quat"][4:8]
+- large_quat  = obs["cube_quat"][8:12]
+- xlarge_quat = obs["cube_quat"][12:16]
+
+- small_half  = obs["cube_size"][0]
+- med_half    = obs["cube_size"][1]
+- large_half  = obs["cube_size"][2]
+- xlarge_half = obs["cube_size"][3]
+
+Containers:
+- A_pos = obs["boxes_pos"][0:3]
+- B_pos = obs["boxes_pos"][3:6]
+- C_pos = obs["boxes_pos"][6:9]
+
+- A_quat = obs["boxes_quat"][0:4]
+- B_quat = obs["boxes_quat"][4:8]
+- C_quat = obs["boxes_quat"][8:12]
+-------------------------------------------------------------------------------
+TASK AND SUCCESS CONDITIONS
+
+Success is achieved iff:
+- All four cubes are inside the hole of container C.
+- Containers A and B contain none of the cubes.
+- Cubes are stacked on C in order:
+    xlarge / extra-large (bottom) → large → medium → small (top).
+- Stack correctness is evaluated using height differences between cubes.
+
+Additionally, illegal Hanoi placements are not allowed: placing a larger cube on top of a smaller cube terminates the episode.
+
+-------------------------------------------------------------------------------
+CONTAINER HOLE GEOMETRY
+
+Each container is a plate-with-hole object.
+
+The container origin is at its geometric center.
+The hole is NOT at the center.
+
+The hole center is at this container-local offset:
+    hole_offset_local = [0.055, 0.0, 0.0]
+
+This means:
+- The hole is shifted along the container’s local +X axis.
+- The cube must be placed over this hole to count as inside the container.
+
+How to compute the placement target:
+
+If the container is approximately axis-aligned (yaw ≈ 0):
+    hole_center = container_pos + [0.055, 0.0, 0.0]
+
+Otherwise:
+    hole_center = container_pos + R(container_quat) @ hole_offset_local
+
+Container orientation:
+- Containers are approximately axis-aligned (yaw ≈ 0).
+- Still write logic that works with small orientation noise.
+
+  
+-------------------------------------------------------------------------------
+OBJECT SIZE HANDLING (IMPORTANT)
+
+The primitives require an object size argument `obj_size` that must account for object scale.
+
+- obs["cube_size"] provides HALF-EDGE lengths.
+- If the primitive expects FULL side length, pass:
+    obj_size_full = 2 * half_edge
+- If the primitive expects HALF-EDGE, pass the half-edge directly.
+Your policy must be consistent and use one convention internally.
+
+Sim2real uncertainty:
+- Add a small safety margin when using object sizes for approach / descent planning (e.g., +2–5 mm).
+
+-------------------------------------------------------------------------------
+NO HARDCODED NAMES / INDICES (WHAT THIS MEANS HERE)
+
+- Do not hardcode environment-internal MuJoCo names or body ids.
+- You MAY use the fixed observation keys listed above (cube_pos, cube_size, boxes_pos, etc.).
+- You MUST NOT assume any other observation keys exist.
+
+
+-------------------------------------------------------------------------------
+OBJECT SIZE
+
+obs["cube_size"] provides half-edge lengths in meters.
+Use these values when reasoning about clearances, stacking, and safety
+margins under noisy observations.
+
+NOte:
+Its beneficial that he cubes have 0 degrees rotation when placed. 
+
+-------------------------------------------------------------------------------
+NO HARDCODED NAMES / INDICES 
+
+- Do not hardcode environment-internal MuJoCo names or body ids.
+- You MAY use the fixed observation keys listed above (cube_pos, cube_size, boxes_pos, etc.).
+- You MUST NOT assume any other observation keys exist.
+
+
+--------------------
+OUTPUT REQUIREMENT
+Output exactly ONE ```python``` code block and nothing else.

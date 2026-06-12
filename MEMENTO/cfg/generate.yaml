@@ -1,0 +1,12 @@
+# config file for reward generation from GPT*
+
+defaults:
+  - config
+  - _self_
+
+root_dir: ${oc.env:ROOT_PATH}
+
+run:
+  # folders
+  generation: 10
+
